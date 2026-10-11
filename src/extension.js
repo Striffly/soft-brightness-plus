@@ -17,7 +17,6 @@
 
 import * as Config from 'resource:///org/gnome/shell/misc/config.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
-import * as PointerWatcher from 'resource:///org/gnome/shell/ui/pointerWatcher.js';
 import {QuickSlider} from 'resource:///org/gnome/shell/ui/quickSettings.js';
 import Clutter from 'gi://Clutter';
 import Cogl from 'gi://Cogl';
@@ -33,6 +32,11 @@ import { Extension, gettext as _ } from 'resource:///org/gnome/shell/extensions/
 import * as Logger from './logger.js';
 import * as Utils from './utils.js';
 import { MouseSpriteContent } from './cursor.js';
+
+// In GS 51, ui/pointerWatcher.js was removed; see CursorTrackerPointerWatcher.
+const PointerWatcher = parseInt(Config.PACKAGE_VERSION) < 51
+    ? await import('resource:///org/gnome/shell/ui/pointerWatcher.js')
+    : null;
 
 // Backlight-like GLSL dimming effect: out = b * c, where b = brightness.
 // Contrast ratios are preserved, like a hardware backlight; blacks stay
@@ -107,46 +111,142 @@ export function hasPaintArea(actor) {
     return width > 0 && height > 0;
 }
 
-export const GammaCurveEffect = GObject.registerClass(
-    class GammaCurveEffect extends Shell.GLSLEffect {
-        _init(brightness, monitorRects) {
-            super._init();
-            this._brightnessLoc = this.get_uniform_location('u_brightness');
-            this._brightness = brightness;
-            this._monitorRects = monitorRects || [];
-        }
+const GAMMA_CURVE_DECLARATIONS = `
+    uniform float u_brightness;
+`;
 
-        vfunc_build_pipeline() {
-            const declarations = `
-                uniform float u_brightness;
-            `;
-            const src = `
-                cogl_color_out.rgb = clamp(u_brightness, 0.0, 1.0) *
-                    clamp(cogl_color_out.rgb, 0.0, 1.0);
-            `;
-            this.add_glsl_snippet(Cogl.SnippetHook.FRAGMENT, declarations, src, false);
-        }
+const GAMMA_CURVE_SOURCE = `
+    cogl_color_out.rgb = clamp(u_brightness, 0.0, 1.0) *
+        clamp(cogl_color_out.rgb, 0.0, 1.0);
+`;
 
-        vfunc_pre_paint(node, paintContext) {
-            if (!hasPaintArea(this.get_actor()))
-                return false;
-            return super.vfunc_pre_paint(node, paintContext);
-        }
+// The effect classes are only defined on the GNOME Shell versions that
+// have their base class (registering the other one would fail).
+function defineGLSLEffectGammaCurve() {
+    return GObject.registerClass(
+        class GammaCurveEffect extends Shell.GLSLEffect {
+            _init(brightness, monitorRects) {
+                super._init();
+                this._brightnessLoc = this.get_uniform_location('u_brightness');
+                this._brightness = brightness;
+                this._monitorRects = monitorRects || [];
+            }
 
-        vfunc_paint_target(node, paintContext) {
-            this.set_uniform_float(this._brightnessLoc, 1,
-                [paintBrightness(this.get_actor(), this._brightness,
-                    this._monitorRects, paintContext)]);
-            super.vfunc_paint_target(node, paintContext);
-        }
+            vfunc_build_pipeline() {
+                this.add_glsl_snippet(Cogl.SnippetHook.FRAGMENT,
+                    GAMMA_CURVE_DECLARATIONS, GAMMA_CURVE_SOURCE, false);
+            }
 
-        update(brightness, monitorRects) {
-            this._brightness = brightness;
-            this._monitorRects = monitorRects;
-            this.queue_repaint();
+            vfunc_pre_paint(node, paintContext) {
+                if (!hasPaintArea(this.get_actor()))
+                    return false;
+                return super.vfunc_pre_paint(node, paintContext);
+            }
+
+            vfunc_paint_target(node, paintContext) {
+                this.set_uniform_float(this._brightnessLoc, 1,
+                    [paintBrightness(this.get_actor(), this._brightness,
+                        this._monitorRects, paintContext)]);
+                super.vfunc_paint_target(node, paintContext);
+            }
+
+            update(brightness, monitorRects) {
+                this._brightness = brightness;
+                this._monitorRects = monitorRects;
+                this.queue_repaint();
+            }
         }
+    );
+}
+
+// In GS 51, Shell.GLSLEffect was removed.  Its replacement,
+// Clutter.ShaderEffect, takes the GLSL as a Cogl snippet and sets uniforms
+// by name.  Exported for tests.
+export function defineShaderEffectGammaCurve() {
+    return GObject.registerClass(
+        class GammaCurveEffect extends Clutter.ShaderEffect {
+            _init(brightness, monitorRects) {
+                super._init();
+                this._brightness = brightness;
+                this._monitorRects = monitorRects || [];
+            }
+
+            vfunc_get_static_snippet() {
+                return Cogl.Snippet.new(Cogl.SnippetHook.FRAGMENT,
+                    GAMMA_CURVE_DECLARATIONS, GAMMA_CURVE_SOURCE);
+            }
+
+            vfunc_pre_paint(node, paintContext) {
+                if (!hasPaintArea(this.get_actor()))
+                    return false;
+                return super.vfunc_pre_paint(node, paintContext);
+            }
+
+            vfunc_paint_target(node, paintContext) {
+                this.set_uniform_float('u_brightness', 1,
+                    [paintBrightness(this.get_actor(), this._brightness,
+                        this._monitorRects, paintContext)]);
+                super.vfunc_paint_target(node, paintContext);
+            }
+
+            update(brightness, monitorRects) {
+                this._brightness = brightness;
+                this._monitorRects = monitorRects;
+                this.queue_repaint();
+            }
+        }
+    );
+}
+
+export const GammaCurveEffect = Shell.GLSLEffect !== undefined
+    ? defineGLSLEffectGammaCurve()
+    : defineShaderEffectGammaCurve();
+
+// Stand-in for ui/pointerWatcher.js on GS 51+: follows the pointer through
+// the cursor tracker's position-invalidated signal, like ui/magnifier.js.
+// Only the subset of the PointerWatcher API used by CursorManager is provided.
+export class CursorTrackerPointerWatcher {
+    constructor(cursorTracker) {
+        this._cursorTracker = cursorTracker;
     }
-);
+
+    addWatch(_interval, fn) {
+        const laters = global.compositor.get_laters();
+        let laterId = 0;
+        const positionId = this._cursorTracker.connect('position-invalidated', () => {
+            if (laterId)
+                return;
+            laterId = laters.add(Meta.LaterType.BEFORE_REDRAW, () => {
+                laterId = 0;
+                fn();
+                return GLib.SOURCE_REMOVE;
+            });
+        });
+        return {
+            remove: () => {
+                this._cursorTracker.disconnect(positionId);
+                if (laterId) {
+                    laters.remove(laterId);
+                    laterId = 0;
+                }
+            },
+        };
+    }
+}
+
+function getPointerWatcher(cursorTracker) {
+    return PointerWatcher !== null
+        ? PointerWatcher.getPointerWatcher()
+        : new CursorTrackerPointerWatcher(cursorTracker);
+}
+
+// In GS 51, Clutter.get_default_backend was removed.
+export function getDefaultSeat() {
+    const backend = Clutter.get_default_backend !== undefined
+        ? Clutter.get_default_backend()
+        : global.stage.context.get_backend();
+    return backend.get_default_seat();
+}
 
 export default class SoftBrightnessExtension extends Extension {
     constructor(...args) {
@@ -839,7 +939,7 @@ class CursorManager {
 
             this._cursorActor = new Clutter.Actor();
             this._cursorActor.add_child(this._cursorSprite);
-            this._cursorWatcher = PointerWatcher.getPointerWatcher();
+            this._cursorWatcher = getPointerWatcher(this._cursorTracker);
 
             this._overlayManager.addActor(this._cursorActor);
             this._cursorInOverlay = true;
@@ -992,7 +1092,7 @@ class CursorManager {
     }
 
     _showSystemCursor() {
-        const seat = Clutter.get_default_backend().get_default_seat();
+        const seat = getDefaultSeat();
 
         if (this._cursorUnfocusInhibited) {
             seat.uninhibit_unfocus();
@@ -1011,7 +1111,7 @@ class CursorManager {
     }
 
     _hideSystemCursor() {
-        const seat = Clutter.get_default_backend().get_default_seat();
+        const seat = getDefaultSeat();
 
         if (!this._cursorUnfocusInhibited) {
             seat.inhibit_unfocus();
