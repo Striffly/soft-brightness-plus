@@ -48,8 +48,26 @@ class Actor {
         }
     }
     get_parent() { return this._parent; }
-    add_effect_with_name(name, effect) { this._effects.push({ name, effect }); }
-    remove_effect(effect) { this._effects = this._effects.filter(e => e.effect !== effect); }
+    add_effect_with_name(name, effect) {
+        this._effects.push({ name, effect });
+        effect._actor = this;
+    }
+    remove_effect(effect) {
+        this._effects = this._effects.filter(e => e.effect !== effect);
+        if (effect._actor === this) effect._actor = null;
+    }
+    // Tests set _paintVolumeSize ([w, h], or null for an unknown paint
+    // volume) and _allocationSize.
+    get_paint_volume() {
+        if (this._paintVolumeSize === null)
+            return null;
+        const [w, h] = this._paintVolumeSize ?? [100, 100];
+        return { get_width: () => w, get_height: () => h };
+    }
+    get_allocation_box() {
+        const [w, h] = this._allocationSize ?? [100, 100];
+        return { get_size: () => [w, h] };
+    }
     get_effects() { return this._effects.map(e => e.effect); }
     set_position(x, y) { this._position = [x, y]; }
     set_size(w, h) { this._size = [w, h]; }
