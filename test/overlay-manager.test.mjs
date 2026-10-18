@@ -29,7 +29,16 @@ const logger = { log() {}, log_debug() {} };
 // are children of uiGroup, not of the stage, and the background group lives
 // inside window_group.  Like mutter, tests add window actors to
 // window_group (or top_window_group for override-redirect windows).
+// Unredirection inhibit count, like mutter's disable_unredirect_count.
+let unredirectInhibits;
+
 function setupGlobals() {
+    unredirectInhibits = 0;
+    global.compositor = {
+        disable_unredirect() { unredirectInhibits++; },
+        enable_unredirect() { unredirectInhibits--; },
+    };
+
     const stage = new Actor();
     stage.name = 'stage';
     stage.width = 1920;
@@ -251,6 +260,20 @@ describe('OverlayManager.show(): shader target selection', () => {
         om.show(0.5);
         assert.equal(effectsOf(bg).length, 0);
         assert.equal(om.initialized(), false);
+        assert.equal(unredirectInhibits, 0);
+    });
+
+    test('inhibits unredirection once while dimming (fullscreen windows stay dimmed)', () => {
+        const { om } = makeOverlay();
+        om.show(0.5);
+        om.show(0.4);
+        assert.equal(unredirectInhibits, 1);
+        om.hideForScreenshot();
+        assert.equal(unredirectInhibits, 1, 'screenshots keep compositing');
+        om.hide();
+        assert.equal(unredirectInhibits, 0);
+        om.hide();
+        assert.equal(unredirectInhibits, 0, 'hide() is balanced');
     });
 });
 

@@ -1046,6 +1046,7 @@ export class OverlayManager {
         this._currentBrightness = null;
         // Cache of the last-applied show() parameters, for redundancy skips
         this._lastShowSig = null;
+        this._unredirectInhibited = false;
     }
 
     enable() {
@@ -1208,6 +1209,8 @@ export class OverlayManager {
             return;
         }
 
+        this._inhibitUnredirect(true);
+
         const targets = this._collectShaderTargets();
 
         // Settings-change storms (e.g. prefs rewriting a key) re-invoke show()
@@ -1260,6 +1263,27 @@ export class OverlayManager {
             this._detachEffect(actor, effect);
         }
         this._shaderTargets = [];
+        this._inhibitUnredirect(false);
+    }
+
+    // A fullscreen window can skip compositing (unredirection on X11, direct
+    // scanout on Wayland), and the shader with it.  Keep compositing while
+    // dimming, as ui/magnifier.js does while magnifying.
+    _inhibitUnredirect(inhibit) {
+        if (inhibit === this._unredirectInhibited)
+            return;
+        this._unredirectInhibited = inhibit;
+        // In GS 48, *_unredirect_for_display functions were moved to global compositor.
+        if (global.compositor?.disable_unredirect === undefined) {
+            if (inhibit)
+                Meta.disable_unredirect_for_display(global.display);
+            else
+                Meta.enable_unredirect_for_display(global.display);
+        } else if (inhibit) {
+            global.compositor.disable_unredirect();
+        } else {
+            global.compositor.enable_unredirect();
+        }
     }
 
     hideForScreenshot() {
