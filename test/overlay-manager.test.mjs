@@ -4,8 +4,8 @@ import assert from 'node:assert/strict';
 // These tests import the REAL extension code (via the gi:// mock loader in
 // hooks.mjs) rather than replicating logic. They cover the shader dimming
 // lifecycle: target selection, the settings-storm dedup guard, actor churn
-// (stage and uiGroup children, window creation/destruction), screenshot
-// hiding and per-view monitor targeting.
+// (stage, uiGroup and window group children), screenshot hiding and
+// per-view monitor targeting.
 
 import Clutter from './mocks/clutter.mjs';
 import Main from './mocks/main.mjs';
@@ -25,11 +25,10 @@ const logger = { log() {}, log_debug() {} };
 
 // ── environment helpers ──────────────────────────────────────────────────────
 
-let windowActors;
-
 // Mirrors GNOME Shell's real actor tree (ui/layout.js): the window groups
 // are children of uiGroup, not of the stage, and the background group lives
-// inside window_group.
+// inside window_group.  Like mutter, tests add window actors to
+// window_group (or top_window_group for override-redirect windows).
 function setupGlobals() {
     const stage = new Actor();
     stage.name = 'stage';
@@ -49,18 +48,13 @@ function setupGlobals() {
     topWindowGroup.name = 'top_window_group';
     Main.uiGroup.add_child(topWindowGroup);
 
-    const display = new Actor(); // used only as a signal emitter
-    windowActors = [];
-
     global.stage = stage;
     global.window_group = windowGroup;
     global.top_window_group = topWindowGroup;
-    global.display = display;
     global.screen_width = 1920;
     global.screen_height = 1080;
-    global.get_window_actors = () => windowActors;
 
-    return { stage, windowGroup, topWindowGroup, backgroundGroup, display };
+    return { stage, windowGroup, topWindowGroup, backgroundGroup };
 }
 
 // Every actor on the path from `actor` up to the stage, `actor` included.
@@ -104,6 +98,25 @@ function effectsOf(actor) {
     return actor.get_effects();
 }
 
+// A GammaCurveEffect attached to an actor, as the extension paints them.
+function attachedEffect(brightness, monitorRects) {
+    const effect = new GammaCurveEffect(brightness, monitorRects);
+    new Actor().add_effect_with_name('soft-brightness-plus-shader', effect);
+    return effect;
+}
+
+// Brightness `effect` paints its actor at through a Clutter.Clone of it.
+function clonePaintBrightness(effect, paintContext) {
+    const actor = effect.get_actor();
+    actor._inClonePaint = true;
+    try {
+        effect.vfunc_paint_target(null, paintContext);
+    } finally {
+        actor._inClonePaint = false;
+    }
+    return effect._uniforms.u_brightness.values[0];
+}
+
 let tree;
 
 beforeEach(() => {
@@ -114,20 +127,21 @@ beforeEach(() => {
 // ── show() target selection and lifecycle ────────────────────────────────────
 
 describe('OverlayManager.show(): shader target selection', () => {
-    test('applies shader to uiGroup children, stage children, window actors and the background', () => {
+    test('applies shader to the children of the stage, uiGroup and the window groups', () => {
         const panel = new Actor();
         Main.uiGroup.add_child(panel);
         const stageLevel = new Actor();
         global.stage.add_child(stageLevel);
         const w1 = new Actor(), w2 = new Actor();
         global.window_group.add_child(w1);
-        global.window_group.add_child(w2);
-        windowActors.push(w1, w2);
+        global.top_window_group.add_child(w2);
+        const tilePreview = new Actor();
+        global.window_group.add_child(tilePreview);
 
         const { om } = makeOverlay();
         om.show(0.5);
 
-        for (const target of [panel, stageLevel, tree.backgroundGroup, w1, w2]) {
+        for (const target of [panel, stageLevel, tree.backgroundGroup, w1, w2, tilePreview]) {
             assert.equal(effectsOf(target).length, 1);
             assert.ok(effectsOf(target)[0] instanceof GammaCurveEffect);
         }
@@ -152,7 +166,6 @@ describe('OverlayManager.show(): shader target selection', () => {
     test('no actor containing window_group carries the shader', () => {
         const w1 = new Actor();
         global.window_group.add_child(w1);
-        windowActors.push(w1);
         const { om } = makeOverlay();
         om.show(0.5);
 
@@ -161,6 +174,28 @@ describe('OverlayManager.show(): shader target selection', () => {
         // ...so a window is dimmed once, by its own effect only.
         const dimmingAncestors = selfAndAncestors(w1).filter(a => effectsOf(a).length > 0);
         assert.deepEqual(dimmingAncestors, [w1]);
+    });
+
+    test('a window shown through a clone (overview preview) is dimmed once', () => {
+        const w1 = new Actor();
+        global.window_group.add_child(w1);
+        const overviewGroup = new Actor();
+        Main.uiGroup.add_child(overviewGroup);
+        const preview = new Clutter.Clone({ source: w1 });
+        overviewGroup.add_child(preview);
+
+        const { om } = makeOverlay();
+        om.show(0.5);
+
+        // The clone is dimmed by its dimmed ancestor...
+        const dimmingAncestors = selfAndAncestors(preview).filter(a => effectsOf(a).length > 0);
+        assert.deepEqual(dimmingAncestors, [overviewGroup]);
+        // ...so the window's own effect must not dim the clone paint again.
+        const left = { x: 0, y: 0, width: 1920, height: 1080 };
+        assert.equal(clonePaintBrightness(effectsOf(w1)[0], paintContextFor(left)), 1.0);
+        effectsOf(w1)[0].vfunc_paint_target(null, paintContextFor(left));
+        assert.deepEqual(effectsOf(w1)[0]._uniforms.u_brightness.values, [0.5],
+            'the window itself is still dimmed');
     });
 
     test('identical repeated show() is a no-op (settings-storm guard)', () => {
@@ -248,6 +283,29 @@ describe('OverlayManager: stage and window churn', () => {
         assert.equal(om._shaderTargets.filter(t => t.actor === popup).length, 1);
     });
 
+    test('windows added to and removed from the window groups follow the shader', () => {
+        const { om } = makeOverlay();
+        om.show(0.5);
+
+        for (const group of [global.window_group, global.top_window_group]) {
+            const win = new Actor();
+            group.add_child(win);
+            assert.equal(effectsOf(win).length, 1);
+            assert.ok(om._shaderTargets.some(t => t.actor === win && t.destroyId));
+
+            group.remove_child(win);
+            assert.equal(effectsOf(win).length, 0);
+            assert.equal(win._connections.length, 0, 'destroy handler disconnected');
+        }
+    });
+
+    test('window added while not dimming gets no shader', () => {
+        makeOverlay();
+        const win = new Actor();
+        global.window_group.add_child(win);
+        assert.equal(effectsOf(win).length, 0);
+    });
+
     test('MetaWindowGroup added to uiGroup while dimming gets no shader', () => {
         const { om } = makeOverlay();
         om.show(0.5);
@@ -283,7 +341,7 @@ describe('OverlayManager: stage and window churn', () => {
 
     test('destroyed actor is dropped from shader bookkeeping', () => {
         const w1 = new Actor();
-        windowActors.push(w1);
+        global.window_group.add_child(w1);
         const { om } = makeOverlay();
         om.show(0.5);
         assert.equal(effectsOf(w1).length, 1);
@@ -291,23 +349,6 @@ describe('OverlayManager: stage and window churn', () => {
         w1.destroy(); // mock emits 'destroy'
         assert.equal(effectsOf(w1).length, 0);
         assert.ok(!om._shaderTargets.some(t => t.actor === w1));
-    });
-
-    test('window-created applies shader to the new window actor', () => {
-        const { om } = makeOverlay();
-        om.show(0.5);
-
-        const win = new Actor();
-        global.display.emit('window-created', { get_compositor_private: () => win });
-        assert.equal(effectsOf(win).length, 1);
-        assert.ok(om._shaderTargets.some(t => t.actor === win && t.destroyId));
-    });
-
-    test('window-created while not dimming applies nothing', () => {
-        makeOverlay();
-        const win = new Actor();
-        global.display.emit('window-created', { get_compositor_private: () => win });
-        assert.equal(effectsOf(win).length, 0);
     });
 });
 
@@ -318,7 +359,7 @@ describe('OverlayManager.hide()', () => {
         const bg = new Actor();
         global.stage.add_child(bg);
         const w1 = new Actor();
-        windowActors.push(w1);
+        global.window_group.add_child(w1);
         const { om } = makeOverlay();
         om.show(0.5);
 
@@ -329,6 +370,14 @@ describe('OverlayManager.hide()', () => {
         }
         assert.equal(om.initialized(), false);
         assert.doesNotThrow(() => om.hide(), 'repeated hide is safe');
+    });
+
+    test('disable() disconnects from every container', () => {
+        const { om } = makeOverlay();
+        om.show(0.5);
+        om.disable();
+        for (const c of [global.stage, Main.uiGroup, global.window_group, global.top_window_group])
+            assert.equal(c._connections.length, 0, `${c.name} still connected`);
     });
 
     test('show() after hide() re-applies fresh effects', () => {
@@ -484,14 +533,14 @@ describe('GammaCurveEffect uniforms', () => {
     const right = { x: 1920, y: 0, width: 1920, height: 1080 };
 
     test('sets the brightness uniform at paint time', () => {
-        const e = new GammaCurveEffect(0.5, []);
+        const e = attachedEffect(0.5, []);
         e.vfunc_paint_target(null, paintContextFor(left));
         assert.deepEqual(e._uniforms.u_brightness.values, [0.5]);
     });
 
     test('leaves areas of unselected monitors at full brightness', () => {
         global.stage.width = 3840;
-        const e = new GammaCurveEffect(0.5, [right]);
+        const e = attachedEffect(0.5, [right]);
 
         e.vfunc_paint_target(null, paintContextFor(right));
         assert.deepEqual(e._uniforms.u_brightness.values, [0.5]);
@@ -506,8 +555,17 @@ describe('GammaCurveEffect uniforms', () => {
         assert.doesNotMatch(e._snippets[0].declarations, /u_monitor/);
     });
 
+    test('paints its actor through a clone at full brightness', () => {
+        global.stage.width = 3840;
+        for (const rects of [[], [left], [right]]) {
+            const e = attachedEffect(0.5, rects);
+            assert.equal(clonePaintBrightness(e, paintContextFor(left)), 1.0);
+            assert.equal(clonePaintBrightness(e, paintContextFor(right)), 1.0);
+        }
+    });
+
     test('update() stores new parameters and queues a repaint', () => {
-        const e = new GammaCurveEffect(0.5, []);
+        const e = attachedEffect(0.5, []);
         e.update(0.3, []);
         assert.equal(e._repaints, 1);
         e.vfunc_paint_target(null, paintContextFor(left));

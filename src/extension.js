@@ -77,8 +77,16 @@ export function paintedStageArea(paintContext) {
     };
 }
 
-// Brightness for the shader in the area `paintContext` paints.
-function paintBrightness(brightness, monitorRects, paintContext) {
+// Brightness for the shader when `actor` is painted into `paintContext`.
+//
+// An actor painted through a Clutter.Clone (overview window previews,
+// Alt+Tab and workspace thumbnails, the magnifier...) is drawn in the
+// clone's place, which is inside a shader target like every visible actor
+// (see OverlayManager._isContainer()) and is dimmed there: dimming the
+// clone paint here as well would square the brightness.
+function paintBrightness(actor, brightness, monitorRects, paintContext) {
+    if (actor.is_in_clone_paint())
+        return 1.0;
     if (monitorRects.length === 0)
         return brightness;
     return brightnessForArea(brightness, monitorRects, paintedStageArea(paintContext));
@@ -127,7 +135,8 @@ export const GammaCurveEffect = GObject.registerClass(
 
         vfunc_paint_target(node, paintContext) {
             this.set_uniform_float(this._brightnessLoc, 1,
-                [paintBrightness(this._brightness, this._monitorRects, paintContext)]);
+                [paintBrightness(this.get_actor(), this._brightness,
+                    this._monitorRects, paintContext)]);
             super.vfunc_paint_target(node, paintContext);
         }
 
@@ -1022,18 +1031,6 @@ class CursorManager {
 }
 
 // Gamma-curve shader lifecycle and cursor actor hosting.
-//
-// Shell.GLSLEffect (ClutterOffscreenEffect) on global.stage itself fails —
-// the stage is the root framebuffer and cannot be redirected to an FBO.
-//
-// Applying it to global.window_group (MetaWindowGroup) also fails — Mutter's
-// MetaWindowGroup has a custom paint() that renders directly to the compositor
-// framebuffer, bypassing Clutter's FBO mechanism, leaving the FBO blank (grey).
-//
-// Solution: skip global.window_group and instead apply the shader to each
-// MetaWindowActor from global.get_window_actors(). MetaWindowActors paint via
-// the standard Clutter path (texture upload + draw), so FBO redirection works.
-// Other stage children (background, UI groups) are still covered per-child.
 export class OverlayManager {
     constructor(logger, settings, monitorManager) {
         this._logger = logger;
@@ -1041,11 +1038,8 @@ export class OverlayManager {
         this._monitorManager = monitorManager;
 
         this._actorGroup = null;
-        this._actorAddedConnection = null;
-        this._actorRemovedConnection = null;
-        this._windowCreatedId = null;
-        this._uiGroupChildAddedConnection = null;
-        this._uiGroupChildRemovedConnection = null;
+        // [{container, addedId, removedId}] — see _isContainer()
+        this._containers = [];
         // [{actor, effect, destroyId}] — actors currently carrying our shader
         this._shaderTargets = [];
         // null = not dimming; number = current brightness level
@@ -1063,53 +1057,15 @@ export class OverlayManager {
         // itself (see _isShaderTarget); the clone dims its own sprite.
         Main.uiGroup.add_child(this._actorGroup);
 
-        // In GS 45, use of "actor" was renamed to "child".
-        const clutterContainer = Clutter.Container !== undefined;
-        this._actorAddedConnection = global.stage.connect(
-            clutterContainer ? 'actor-added' : 'child-added',
-            this._onStageChildAdded.bind(this));
-        this._actorRemovedConnection = global.stage.connect(
-            clutterContainer ? 'actor-removed' : 'child-removed',
-            this._onStageChildRemoved.bind(this));
-
-        // Apply shader to new windows as they are created.
-        this._windowCreatedId = global.display.connect('window-created', (_display, win) => {
-            if (this._currentBrightness === null) return;
-            const actor = win.get_compositor_private();
-            if (actor)
-                this._applyShaderToActor(actor);
-        });
-
-        // uiGroup's children carry the shader individually (see
-        // _isShaderTarget), so follow additions and removals.  The pointer
-        // watch re-raises the clone group on motion, but a popup opened via
-        // keyboard with the pointer stationary would cover the clone until
-        // the mouse next moves — also re-raise when something is added.
-        this._uiGroupChildAddedConnection = Main.uiGroup.connect(
-            clutterContainer ? 'actor-added' : 'child-added',
-            (_group, child) => {
-                if (this._currentBrightness !== null && this._isShaderTarget(child))
-                    this._applyShaderToActor(child);
-                this.raiseToTop();
-            });
-        this._uiGroupChildRemovedConnection = Main.uiGroup.connect(
-            clutterContainer ? 'actor-removed' : 'child-removed',
-            (_group, child) => this._removeActorFromTargets(child));
+        this._watchContainer(global.stage);
     }
 
     disable() {
-        if (this._windowCreatedId) {
-            global.display.disconnect(this._windowCreatedId);
-            this._windowCreatedId = null;
+        for (const { container, addedId, removedId } of this._containers) {
+            container.disconnect(addedId);
+            container.disconnect(removedId);
         }
-        global.stage.disconnect(this._actorAddedConnection);
-        global.stage.disconnect(this._actorRemovedConnection);
-        Main.uiGroup.disconnect(this._uiGroupChildAddedConnection);
-        Main.uiGroup.disconnect(this._uiGroupChildRemovedConnection);
-        this._actorAddedConnection = null;
-        this._actorRemovedConnection = null;
-        this._uiGroupChildAddedConnection = null;
-        this._uiGroupChildRemovedConnection = null;
+        this._containers = [];
 
         this.hide();
 
@@ -1149,42 +1105,64 @@ export class OverlayManager {
 
     // Which actors carry the shader.
     //
-    // The MetaWindowGroups (global.window_group, global.top_window_group and
-    // the feedback group) cannot be redirected into an offscreen framebuffer:
-    // they paint through mutter's culling, which goes wrong inside an FBO.
-    // They live inside uiGroup, not on the stage, so the shader must not go
-    // on uiGroup either: there it dropped the desktop background from the
-    // dimmed image whenever the screen changed (flickering, worst on
-    // monitors with different refresh rates), and windows were dimmed twice
-    // (once by uiGroup, once by their own effect).
+    // The shader cannot go on the stage (the root framebuffer), nor on a
+    // MetaWindowGroup (window_group, top_window_group, the feedback group):
+    // those paint through mutter's culling, which goes wrong inside an
+    // offscreen framebuffer.  Nor on uiGroup, which contains them: there it
+    // dropped the desktop background from the dimmed image whenever the
+    // screen changed (flickering, worst on monitors with different refresh
+    // rates).  So these containers are walked through, and the shader goes
+    // on every other actor directly inside them: the shell's UI groups, the
+    // window actors, the background group...  Every visible actor is then
+    // inside exactly one shader target, and is dimmed once.  (Clones are
+    // dimmed by the target they sit in, see paintBrightness().)
     //
-    // So the shader goes on each of uiGroup's other children, on every
-    // MetaWindowActor (they are redirectable) and on the background groups
-    // inside window_group.  The cursor-clone group is excluded: an offscreen
-    // effect on an actor that moves every frame leaves stale trails, so the
-    // clone dims itself instead (see brightnessAt()).
+    // The cursor-clone group is excluded: an offscreen effect on an actor
+    // that moves every frame leaves stale trails, so the clone dims itself
+    // instead (see brightnessAt()).
+    _isContainer(actor) {
+        return actor === global.stage || actor === Main.uiGroup ||
+            actor instanceof Meta.WindowGroup;
+    }
+
     _isShaderTarget(actor) {
-        return actor !== this._actorGroup &&
-            actor !== Main.uiGroup &&
-            !(actor instanceof Meta.WindowGroup);
+        return actor !== this._actorGroup && !this._isContainer(actor);
     }
 
-    _collectShaderTargets() {
-        const stageTargets = global.stage.get_children().filter(c => this._isShaderTarget(c));
-        const uiGroupTargets = Main.uiGroup.get_children().filter(c => this._isShaderTarget(c));
-        const backgroundGroups = global.window_group.get_children().filter(c =>
-            c instanceof Meta.BackgroundGroup);
-        const windowActors = global.get_window_actors ? global.get_window_actors() : [];
-        return [...stageTargets, ...uiGroupTargets, ...backgroundGroups, ...windowActors];
+    _collectShaderTargets(container = global.stage) {
+        return container.get_children().flatMap(child =>
+            this._isContainer(child)
+                ? this._collectShaderTargets(child)
+                : this._isShaderTarget(child) ? [child] : []);
     }
 
-    _onStageChildAdded(_stage, child) {
-        if (this._isShaderTarget(child) && this._currentBrightness !== null)
+    // Follow the children (windows, popups...) of `container` and of the
+    // containers inside it as they come and go.
+    _watchContainer(container) {
+        // In GS 45, use of "actor" was renamed to "child".
+        const clutterContainer = Clutter.Container !== undefined;
+        const addedId = container.connect(
+            clutterContainer ? 'actor-added' : 'child-added',
+            (_container, child) => this._onChildAdded(child));
+        const removedId = container.connect(
+            clutterContainer ? 'actor-removed' : 'child-removed',
+            (_container, child) => this._removeActorFromTargets(child));
+        this._containers.push({ container, addedId, removedId });
+
+        for (const child of container.get_children()) {
+            if (this._isContainer(child))
+                this._watchContainer(child);
+        }
+    }
+
+    _onChildAdded(child) {
+        if (this._currentBrightness !== null && this._isShaderTarget(child))
             this._applyShaderToActor(child);
-    }
-
-    _onStageChildRemoved(_stage, child) {
-        this._removeActorFromTargets(child);
+        // The pointer watch re-raises the clone group on motion, but a popup
+        // opened via keyboard with the pointer stationary would cover the
+        // clone until the mouse next moves — also re-raise when something
+        // is added.
+        this.raiseToTop();
     }
 
     _removeActorFromTargets(actor) {

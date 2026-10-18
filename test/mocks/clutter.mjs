@@ -69,12 +69,21 @@ class Actor {
         return { get_size: () => [w, h] };
     }
     get_effects() { return this._effects.map(e => e.effect); }
+    // Tests set _inClonePaint while "painting" the actor through a Clone.
+    is_in_clone_paint() { return this._inClonePaint ?? false; }
     set_position(x, y) { this._position = [x, y]; }
     set_size(w, h) { this._size = [w, h]; }
     set(props) { Object.assign(this, props); }
     show() { this.visible = true; }
     hide() { this.visible = false; }
     destroy() { this.emit('destroy'); }
+}
+
+class Clone extends Actor {
+    constructor(props = {}) {
+        super(props);
+        this.source = props.source ?? null;
+    }
 }
 
 export const invalidateCalls = [];
@@ -99,6 +108,7 @@ const mockSeat = {
 
 export default {
     Actor,
+    Clone,
     RequestMode: { CONTENT_SIZE: 0 },
     Content: ContentIface,
     // Leave Container undefined to simulate GS 45+ (uses 'child-added'/'child-removed')
